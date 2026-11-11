@@ -1,53 +1,69 @@
-# Tata Motors Smart Vehicle Key Management System — Kiosk Frontend
+# Tata Motors Smart Vehicle Key Management System (VKMS) – Frontend
 
-React + Tailwind touch-first kiosk UI for a 600 × 1024 portrait display.
+React + Vite touchscreen kiosk prototype. The app has three top-level screens: operation selection, biometric verification for KEY IN, and the operation-specific workflow. KEY OUT uses EP-number lookup and does not ask for biometric verification.
 
-## Run
-
-Requires Node.js 20+.
+## Run locally
 
 ```bash
-cp .env.example .env
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open `http://localhost:5173`. Build with `npm run build`.
+Open the URL printed by Vite (normally `http://localhost:5173/`). The default `.env.example` uses demo mode. Demo mode is visibly labelled and does not operate physical hardware.
 
-## Demo vs real hardware
+## Current workflows
 
-- `VITE_DEMO_MODE=true`: visibly displays **SIMULATION MODE** and uses sample driver, vehicle, parking and slot data. Fingerprint and lock/sensor responses are simulated. Never use this setting in production.
-- `VITE_DEMO_MODE=false`: calls FastAPI endpoints configured by `VITE_API_BASE_URL`. The browser does not pretend to read a fingerprint scanner; it waits for backend biometric verification. The transaction is committed only after backend-reported slot state confirmation.
+### KEY OUT
+1. Driver enters the vehicle EP number (the vehicle ID).
+2. Backend looks up the vehicle, its recorded parking area, and the occupied key-holder slot.
+3. The UI displays the parking area and slot; the backend/controller is asked to blink the slot indicator and unlock that holder.
+4. A 30-second countdown starts after the unlock command is accepted. The controller must enforce its own 30-second safety timeout too.
+5. The frontend polls holder state. It completes the transaction only after the slot sensor/RFID confirms key removal. If the timeout expires, it asks the controller to relock and does not complete the transaction.
 
-## Main pages
+### KEY IN
+1. Driver completes biometric verification.
+2. Driver ID and the driver's currently issued vehicle/EP number are loaded automatically.
+3. Driver selects only the parking area where the vehicle was parked.
+4. Backend allocates an empty, healthy holder slot automatically.
+5. The frontend asks the controller to turn that slot's location LED ON.
+6. The transaction completes only after the holder sensor/RFID confirms the correct key deposit. The indicator is then switched OFF.
 
-1. Main operation selection
-2. Biometric verification
-3. Smart key workflow (KEY IN / KEY OUT are steps within this page)
+The transaction screens intentionally show only operationally useful details. The backend remains the source of truth; frontend demo state is not production hardware integration.
 
-## FastAPI contract expected
+## Environment
 
-JSON endpoints; optionally sends `Authorization: Bearer <VITE_API_TOKEN>`:
+- `VITE_DEMO_MODE=true`: local simulated workflow; clearly labelled in the UI.
+- `VITE_DEMO_MODE=false`: use the FastAPI service configured by `VITE_API_BASE_URL`.
+- `VITE_API_BASE_URL`: backend origin, e.g. `http://127.0.0.1:8000`.
+- `VITE_API_TOKEN`: prototype-only bearer token setting. Do not put long-lived privileged secrets in a public frontend build; use short-lived scoped sessions in production.
+- `VITE_IDLE_TIMEOUT_MS`: idle timeout for the entry screens. Active key transactions are not interrupted by the UI idle timeout.
 
-| Method | Endpoint | Expected response / purpose |
-|---|---|---|
-| POST | `/api/biometric/verify` | `{verified, driver, session_token}`; resolve real fingerprint event |
-| GET | `/api/drivers/{driver_id}` | Driver details |
-| GET | `/api/drivers/{driver_id}/vehicles?operation=KEY_IN` | Eligible vehicle list for operation |
-| GET | `/api/parking-locations` | Array of `{location_id,name,available_spaces,occupied_spaces}` |
-| GET | `/api/slots` | Array of `{slot_id,status,key_id}`; status available/occupied/faulty |
-| POST | `/api/key-in/allocate-slot` | `{vehicle_id,parking_location_id,slot_id}` → `{slot_id,allocation_id}` |
-| POST | `/api/hardware/unlock` | `{operation,slot_id,vehicle_id}` → `{accepted,command_id}` |
-| GET | `/api/slots/{slot_id}/state` | Confirmed physical state, e.g. `{status:'occupied'}` |
-| POST | `/api/transactions/complete` | Commit after confirmed movement; returns transaction receipt |
+## Backend API contract expected by this frontend
 
-For KEY OUT, selected occupied slot must contain the selected vehicle's key ID. For KEY IN, only an available slot may be reserved. The backend/controller must independently enforce all rules; frontend validation is not a security boundary.
+All endpoints below are examples of the contract the FastAPI backend must implement. Adapt them to the actual database and controller firmware.
 
-## Production integration requirements
+- `POST /api/biometric/verify` → `{ verified, driver: { driver_id } }` (KEY IN only)
+- `GET /api/drivers/{driver_id}` → driver record including `driver_id`, `name`
+- `GET /api/drivers/{driver_id}/vehicles?operation=KEY_IN` → array of vehicles; KEY IN must return the driver's currently issued vehicle, including `vehicle_id` (EP number), `key_id`
+- `GET /api/parking-locations` → `[{ location_id, name }]`
+- `GET /api/vehicles/by-ep/{ep_number}` → flat vehicle record including `vehicle_id` (same as EP number), `key_id`, `key_status`, `parking_location`, `slot_id`
+- `POST /api/key-in/allocate-slot` body `{ vehicle_id, parking_location_id }` → `{ slot_id, allocation_id }`; allocation must be atomic and only choose an empty, healthy slot
+- `POST /api/hardware/unlock` body `{ operation, slot_id, vehicle_id, indicator: "blink", timeout_seconds: 30 }` → accepted command
+- `POST /api/hardware/guide-slot` body `{ operation, slot_id, vehicle_id, indicator: "on" | "off" }` → accepted command
+- `POST /api/hardware/lock` body `{ slot_id, vehicle_id }` → accepted relock command
+- `GET /api/slots/{slot_id}/state` → current physical state; for KEY OUT, `status: "available"` confirms removal; for KEY IN, `status: "occupied"` and matching `key_id` confirms deposit
+- `POST /api/transactions/complete` body includes operation, vehicle_id, slot_id and (for KEY IN) driver_id, parking_location_id, allocation_id
 
-- Connect the fingerprint reader to a trusted local controller/service. A normal browser cannot directly and securely read a UART/USB fingerprint module. The scanner/backend must perform the actual biometric match and return an authenticated driver identity.
-- ESP32/key-holder controller must report RFID UID and occupancy/removal events to FastAPI. Backend validates the expected UID, slot, reservation, driver authorization and transaction before updating state.
-- Use WebSocket/SSE events for production rather than polling; current frontend has a 30-second slot-state polling fallback.
-- Enforce API authentication, authorization, idempotency, database transactions/locking, duplicate-issue prevention, slot reservation, audit logs, timeout recovery and safe reconciliation after network/power loss.
-- Do not put a long-lived privileged API secret in browser code in production. Use short-lived scoped kiosk sessions.
-- The frontend intentionally does not offer manual EP number entry or a numeric keypad.
+## Hardware safety requirements
+
+- The ESP32/controller must enforce the 30-second KEY OUT relock timeout independently of the browser.
+- A browser timer is only a user display, never the safety mechanism.
+- Never mark a key issued/deposited based only on an unlock, LED command, or button click.
+- Confirm physical state using RFID and/or slot occupancy sensors; verify that the deposited RFID belongs to the expected key.
+- Use authenticated, authorized, idempotent backend operations and prevent concurrent transactions on the same key/slot.
+- On network loss or timeout, reconcile the physical holder state before changing database state. A failed UI request does not prove the physical lock is closed.
+
+## GitHub Pages
+
+The Vite `base` is configured as `/TATA/` for the public repository `hub-soham/TATA`. A GitHub Actions workflow is included at `.github/workflows/deploy.yml`. In repository Settings → Pages, set Source to **GitHub Actions**.
